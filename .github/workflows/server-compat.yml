@@ -146,6 +146,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
     timeout-minutes: 90
+    env:
+      PACKAGE_NAME: kvmem-windows-cuda13.2-sm120a
 
     steps:
       - name: Checkout repository and submodules
@@ -153,11 +155,13 @@ jobs:
         with:
           submodules: recursive
 
+      # scripts/windows/build.ps1 требует nvcc >= 13.2.86 (CUDA 13.2 Update 2).
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '13.2.0'
+          cuda: '13.2.2'
 
+      # Даёт x64-окружение MSVC и dumpbin, который нужен package.ps1.
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -170,37 +174,73 @@ jobs:
           cmake --version
           cl 2>&1 || true
 
-      - name: Apply KVMem patches
-        shell: bash
-        run: bash scripts/apply-patches.sh
-
+      # build.ps1 сам накладывает патчи на llama.cpp и собирает статически
+      # (BUILD_SHARED_LIBS=OFF, Ninja, cl), как и релизные сборки.
       - name: Build KVMem with CUDA
-        shell: bash
-        env:
-          NPROC: '2'
-          CMAKE_BUILD_TYPE: Release
-          CMAKE_CUDA_ARCHITECTURES: 120a-real
-        run: bash scripts/build-cuda.sh
+        shell: powershell
+        run: >-
+          ./scripts/windows/build.ps1
+          -BuildOnly
+          -Jobs 2
+          -CudaPath "$env:CUDA_PATH"
+          -CudaArchitectures '120a-real'
 
-      - name: List build outputs
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build web UI
+        continue-on-error: true
+        shell: bash
+        run: python scripts/build-webui.py --full-ui --output build-win/share/kvmem/ui
+
+      - name: Create source manifest and archive
+        shell: powershell
+        run: |
+          $files = [ordered]@{}
+          foreach ($rel in 'VERSION', 'README.md', 'CMakeLists.txt', 'kvmem/CMakeLists.txt', 'llama.cpp/LICENSE') {
+            $files[$rel] = (Get-FileHash -LiteralPath $rel -Algorithm SHA256).Hash
+          }
+          foreach ($f in Get-ChildItem scripts/windows -File) {
+            $files["scripts/windows/$($f.Name)"] = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+          }
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP/source-manifest.json", (@{ files = $files } | ConvertTo-Json -Depth 4))
+          git archive --format=zip -o "$env:RUNNER_TEMP/source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
+
+      # Копирует exe и все нужные DLL (cudart/cublas/cublasLt) рядом с ними,
+      # добавляет UI и PowerShell-лаунчеры.
+      - name: Package runtime
+        shell: powershell
+        run: >-
+          ./scripts/windows/package.ps1
+          -SourceDir "$PWD"
+          -BuildDir "$PWD/build-win"
+          -SourceManifest "$env:RUNNER_TEMP/source-manifest.json"
+          -SourceArchive "$env:RUNNER_TEMP/source.zip"
+          -OutputDir "$env:RUNNER_TEMP/$env:PACKAGE_NAME"
+          -CudaPath "$env:CUDA_PATH"
+
+      - name: List package contents
         if: always()
         shell: bash
         run: |
-          if [ -d build/bin ]; then
-            find build/bin -maxdepth 3 -type f -print
+          if [ -d "$RUNNER_TEMP/$PACKAGE_NAME" ]; then
+            find "$RUNNER_TEMP/$PACKAGE_NAME" -maxdepth 3 -type f -print
           else
-            echo "build/bin was not created"
+            echo "package directory was not created"
           fi
 
-      - name: Upload Windows CUDA binaries
+      - name: Upload Windows CUDA package
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: kvmem-windows-cuda-13.2-blackwell
-          path: build/bin/**
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ runner.temp }}/${{ env.PACKAGE_NAME }}
           if-no-files-found: error
           retention-days: 7
-          
+
   host-and-server-units-linux:
     if: ${{ always() }}
     needs: [host-linux, host-windows, cuda-build-linux]
