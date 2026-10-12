@@ -209,6 +209,17 @@ jobs:
           git archive --format=zip -o "$env:RUNNER_TEMP/source.zip" HEAD
           if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
 
+      # llama.cpp линкуется с OpenSSL (libssl/libcrypto), а package.ps1 ищет DLL
+      # только в build-win/bin и в папке CUDA, поэтому кладём их рядом с exe.
+      - name: Stage OpenSSL DLLs
+        shell: powershell
+        run: |
+          foreach ($name in 'libssl-3-x64.dll', 'libcrypto-3-x64.dll') {
+            $cmd = Get-Command $name -ErrorAction Stop | Select-Object -First 1
+            Write-Host "$name -> $($cmd.Source)"
+            Copy-Item -LiteralPath $cmd.Source -Destination 'build-win/bin'
+          }
+
       # Копирует exe и все нужные DLL (cudart/cublas/cublasLt) рядом с ними,
       # добавляет UI и PowerShell-лаунчеры.
       - name: Package runtime
